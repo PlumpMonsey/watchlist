@@ -7,9 +7,6 @@ from flask_sqlalchemy import SQLAlchemy
 from markupsafe import escape
 
 
-
-
-
 WIN = sys.platform.startswith('win')
 if WIN:  # 如果是 Windows 系统，使用三个斜线
     prefix = 'sqlite:///'
@@ -77,13 +74,20 @@ def initdb(drop):
     click.echo('Initialized database.')  # 输出提示信息
 
 
+@app.context_processor
+def inject_user():
+    user = User.query.first()
+    return dict(user=user)
+
+@app.errorhandler(404)  # 传入要处理的错误代码
+def page_not_found(e):  # 接受异常对象作为参数
+    return render_template('404.html'), 404  # 返回模板和状态码
 
 @app.route('/')
 def index():
     # <模型类>.query.<过滤方法（可选）>.<查询方法>
-    user = User.query.first()   # 读取用户信息
     movies  = Movie.query.all() # 读取电影信息
-    return render_template('index.html', user=user, movies=movies)
+    return render_template('index.html', movies=movies)
 
 # @app.route('/')
 # def hello():
