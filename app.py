@@ -1,38 +1,46 @@
 import os
 import sys
 import click
-
-from flask import Flask, url_for, render_template, request, redirect, flash
+from flask import Flask, render_template, request, url_for, redirect, flash
 from flask_sqlalchemy import SQLAlchemy
-from markupsafe import escape
+from flask_login import LoginManager, login_user, login_required, logout_user, current_user, UserMixin
+from werkzeug.security import generate_password_hash, check_password_hash
 
-
+# SQLite URI compatible
 WIN = sys.platform.startswith('win')
-if WIN:  # 如果是 Windows 系统，使用三个斜线
+if WIN:
     prefix = 'sqlite:///'
-else:  # 否则使用四个斜线
+else:
     prefix = 'sqlite:////'
-
 app = Flask(__name__)
+app.config['SECRET_KEY'] = 'dev'
 app.config['SQLALCHEMY_DATABASE_URI'] = prefix + os.path.join(app.root_path, 'data.db')
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False  # 关闭对模型修改的监控
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# 初始化拓展，传入实例程序 app
 db = SQLAlchemy(app)
-
-class User(db.Model):  # 表名将会是 user（自动生成，小写处理）
-    id = db.Column(db.Integer, primary_key=True)  # 主键
-    name = db.Column(db.String(20))  # 名字
+login_manager = LoginManager(app)
 
 
-class Movie(db.Model):  # 表名将会是 movie
-    id = db.Column(db.Integer, primary_key=True)  # 主键
-    title = db.Column(db.String(60))  # 电影标题
-    year = db.Column(db.String(4))  # 电影年份
+@login_manager.user_loader
+def load_user(user_id):
+    user = User.query.get(int(user_id))
+    return user
 
 
+login_manager.login_view = 'login'
+# login_manager.login_message = 'Your custom message'
 
-# 创建虚拟数据
+
+@app.cli.command()
+@click.option('--drop', is_flag=True, help='Create after drop.')
+def initdb(drop):
+    """Initialize the database."""
+    if drop:
+        db.drop_all()
+    db.create_all()
+    click.echo('Initialized database.')
+
+
 @app.cli.command()
 def forge():
     """Generate fake data."""
@@ -50,112 +58,169 @@ def forge():
         {'title': 'WALL-E', 'year': '2008'},
         {'title': 'The Pork of Music', 'year': '2012'},
     ]
-
-    # 用户
-    user = User(name = name)
+    user = User(name=name)
     db.session.add(user)
-    # 电影
     for m in movies:
-        movie = Movie(title = m['title'], year = m['year'])
+        movie = Movie(title=m['title'], year=m['year'])
         db.session.add(movie)
-    
     db.session.commit()
     click.echo('Done.')
 
 
 
-@app.cli.command()  # 注册为命令，可以传入 name 参数来自定义命令
-@click.option('--drop', is_flag=True, help='Create after drop.')  # 设置选项
-def initdb(drop):
-    """Initialize the database."""
-    if drop:  # 判断是否输入了选项
-        db.drop_all()
+@app.cli.command()
+@click.option('--username', prompt=True, help='The username used to login.')
+@click.option('--password', prompt=True, hide_input=True, confirmation_prompt=True, help='The password used to login.')
+def admin(username, password):
+    """Create user."""
     db.create_all()
-    click.echo('Initialized database.')  # 输出提示信息
 
+    user = User.query.first()
+    if user is not None:
+        click.echo('Updating user...')
+        user.username = username
+        user.set_password(password)
+    else:
+        click.echo('Creating user...')
+        user = User(username=username, name='Admin')
+        user.set_password(password)
+        db.session.add(user)
+
+    db.session.commit()
+    click.echo('Done.')
+
+
+class User(db.Model, UserMixin):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(20))
+    username = db.Column(db.String(20))
+    password_hash = db.Column(db.String(128))
+
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def validate_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+
+class Movie(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(60))
+    year = db.Column(db.String(4))
 
 @app.context_processor
 def inject_user():
     user = User.query.first()
     return dict(user=user)
 
-@app.errorhandler(404)  # 传入要处理的错误代码
-def page_not_found(e):  # 接受异常对象作为参数
-    return render_template('404.html'), 404  # 返回模板和状态码
+@app.errorhandler(400)
+def bad_request(e):
+    return render_template('400.html'), 400
 
-@app.route('/', methods = ['GET', 'POST'])
+@app.errorhandler(404)
+def page_not_found(e):
+    return render_template('404.html'), 404
+
+@app.errorhandler(500)
+def internal_server_error(e):
+    return render_template('500.html'), 500
+
+
+@app.route('/', methods=['GET', 'POST'])
 def index():
-    if request.method == 'POST':  # 判断是否是 POST 请求
-        # 获取表单数据
-        title = request.form.get('title')  # 传入表单对应输入字段的 name 值
-        year = request.form.get('year')
-        # 验证数据
-        if not title or not year or len(year) > 4 or len(title) > 60:
-            flash('Invalid input.')  # 显示错误提示
-            return redirect(url_for('index'))  # 重定向回主页
-        # 保存表单数据到数据库
-        movie = Movie(title=title, year=year)  # 创建记录
-        db.session.add(movie)  # 添加到数据库会话
-        db.session.commit()  # 提交数据库会话
-        flash('Item created.')  # 显示成功创建的提示
-        return redirect(url_for('index'))  # 重定向回主页
+    if request.method == 'POST':
+        if not current_user.is_authenticated:
+            return redirect(url_for('index'))
 
-    # <模型类>.query.<过滤方法（可选）>.<查询方法>
-    movies  = Movie.query.all() # 读取电影信息
-    return render_template('index.html', movies=movies)
-
-@app.route('/movie/edit/<int:movie_id>', methods=['GET', 'POST'])
-def edit(movie_id):
-    movie = Movie.query.get_or_404(movie_id)
-
-    if request.method == 'POST':  # 处理编辑表单的提交请求
         title = request.form['title']
         year = request.form['year']
 
-        if not title or not year or len(year) != 4 or len(title) > 60:
+        if not title or not year or len(year) > 4 or len(title) > 60:
             flash('Invalid input.')
-            return redirect(url_for('edit', movie_id=movie_id))  # 重定向回对应的编辑页面
+            return redirect(url_for('index'))
+        movie = Movie(title=title, year=year)
+        db.session.add(movie)
+        db.session.commit()
+        flash('Item created.')
+        return redirect(url_for('index'))
+    movies = Movie.query.all()
+    return render_template('index.html', movies=movies)
 
-        movie.title = title  # 更新标题
-        movie.year = year  # 更新年份
-        db.session.commit()  # 提交数据库会话
+
+@app.route('/movie/edit/<int:movie_id>', methods=['GET', 'POST'])
+@login_required
+def edit(movie_id):
+    movie = Movie.query.get_or_404(movie_id)
+
+    if request.method == 'POST':
+        title = request.form['title']
+        year = request.form['year']
+        if not title or not year or len(year) > 4 or len(title) > 60:
+            flash('Invalid input.')
+            return redirect(url_for('edit', movie_id=movie_id))
+        movie.title = title
+        movie.year = year
+        db.session.commit()
         flash('Item updated.')
-        return redirect(url_for('index'))  # 重定向回主页
+        return redirect(url_for('index'))
+    return render_template('edit.html', movie=movie)
 
-    return render_template('edit.html', movie=movie)  # 传入被编辑的电影记录
 
-@app.route('/movie/delete/<int:movie_id>', methods=['POST'])  # 限定只接受 POST 请求
+@app.route('/movie/delete/<int:movie_id>', methods=['POST'])
+@login_required
 def delete(movie_id):
-    movie = Movie.query.get_or_404(movie_id)  # 获取电影记录
-    db.session.delete(movie)  # 删除对应的记录
-    db.session.commit()  # 提交数据库会话
+    movie = Movie.query.get_or_404(movie_id)
+    db.session.delete(movie)
+    db.session.commit()
     flash('Item deleted.')
-    return redirect(url_for('index'))  # 重定向回主页
+    return redirect(url_for('index'))
 
-# @app.route('/')
-# def hello():
-#     return '<h1>Hello Totoro!</h1><img src="http://helloflask.com/totoro.gif">'
 
-# @app.route('/user')
-# def hello_user():
-#     return '<h1>Hello User!</h1><img src="http://helloflask.com/totoro.gif">'
+@app.route('/settings', methods=['GET', 'POST'])
+@login_required
+def settings():
+    if request.method == 'POST':
+        name = request.form['name']
 
-# @app.route('/user/<name>')
-# def user_page(name):
-#     return f'User: {escape(name)}'
+        if not name or len(name) > 20:
+            flash('Invalid input.')
+            return redirect(url_for('settings'))
 
-# @app.route('/test')
-# # 访问 http://localhost:5000/test 后在命令行窗口查看输出的 URL
-# def test_url_for():
-#     # 生成 hello 视图函数对应的 URL，将会输出：/
-#     print(url_for('hello'))
-#     # 输出：/user
-#     print(url_for('hello_user'))
-#     # 输出：/user/Plump
-#     print(url_for('user_page', name='Plump'))
-#     # 输出：/test
-#     print(url_for('test_url_for'))
-#     # 输出：/test?num=2
-#     print(url_for('test_url_for', num=2))
-#     return 'Test Page'
-    
+        user = User.query.first()
+        user.name = name
+        db.session.commit()
+        flash('Settings updated.')
+        return redirect(url_for('index'))
+
+    return render_template('settings.html')
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+
+        if not username or not password:
+            flash('Invalid input.')
+            return redirect(url_for('login'))
+
+        user = User.query.first()
+
+        if username == user.username and user.validate_password(password):
+            login_user(user)
+            flash('Login success.')
+            return redirect(url_for('index'))
+
+        flash('Invalid username or password.')
+        return redirect(url_for('login'))
+
+    return render_template('login.html')
+
+
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    flash('Goodbye.')
+    return redirect(url_for('index'))
